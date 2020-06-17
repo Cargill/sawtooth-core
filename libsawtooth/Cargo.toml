@@ -39,6 +39,7 @@ experimental = [
     "stable",
     # The following features are experimental:
     "btree-store",
+    "journal",
     "lmdb-store",
     "receipt-store",
     "redis-store",
@@ -46,6 +47,7 @@ experimental = [
 ]
 
 btree-store = ["stores"]
+journal = []
 lmdb-store = ["lmdb-zero", "stores"]
 receipt-store = ["stores"]
 redis-store = ["redis", "stores"]
