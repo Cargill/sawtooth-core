@@ -16,6 +16,8 @@
 #[macro_use]
 extern crate log;
 
+#[cfg(feature = "hashlib")]
+pub mod hashlib;
 #[cfg(feature = "journal")]
 pub mod journal;
 #[cfg(feature = "stores")]
