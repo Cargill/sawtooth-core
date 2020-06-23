@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use sawtooth::block::Block;
+use crate::block::Block;
 
 #[derive(Debug)]
 pub enum BlockStoreError {

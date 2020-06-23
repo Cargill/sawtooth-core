@@ -14,6 +14,7 @@
 
 pub const NULL_BLOCK_IDENTIFIER: &str = "0000000000000000";
 
+pub mod block_store;
 pub mod chain;
 pub mod chain_id_manager;
 pub mod fork_cache;
