@@ -33,14 +33,16 @@ use sawtooth::journal::chain_commit_state::TransactionCommitCache;
 use sawtooth::journal::commit_store::CommitStore;
 use sawtooth::journal::validation_rule_enforcer;
 use sawtooth::state::settings_view::SettingsView;
-use sawtooth::{batch::Batch, block::Block, scheduler::Scheduler, transaction::Transaction};
+use sawtooth::{
+    batch::Batch, protocol::block::BlockPair, scheduler::Scheduler, transaction::Transaction,
+};
 
 use crate::py_object_wrapper::PyObjectWrapper;
 
 use pylogger;
 
 pub struct FFICandidateBlock {
-    previous_block: Block,
+    previous_block: BlockPair,
     commit_store: CommitStore,
     scheduler: Box<dyn Scheduler>,
     max_batches: usize,
@@ -66,7 +68,7 @@ impl CandidateBlock for FFICandidateBlock {
     }
 
     fn previous_block_id(&self) -> String {
-        self.previous_block.header_signature.clone()
+        self.previous_block.block().header_signature().to_string()
     }
 
     fn can_add_batch(&self) -> bool {
@@ -126,11 +128,9 @@ impl CandidateBlock for FFICandidateBlock {
             batches_to_add.push(batch);
 
             {
-                let batches_to_test = self
-                    .pending_batches
-                    .iter()
-                    .chain(batches_to_add.iter())
-                    .collect::<Vec<_>>();
+                let mut batches_to_test = self.pending_batches.clone();
+                batches_to_test.append(&mut batches_to_add.clone());
+
                 if !validation_rule_enforcer::enforce_validation_rules(
                     &self.settings_view,
                     &self.get_signer_public_key_hex(),
@@ -281,10 +281,10 @@ impl CandidateBlock for FFICandidateBlock {
             .map(Batch::from)
             .collect::<Vec<Batch>>();
 
-        let batch_ids: Vec<&str> = batches
+        let batch_ids = batches
             .iter()
-            .map(|batch| batch.header_signature.as_str())
-            .collect();
+            .map(|batch| batch.header_signature.clone())
+            .collect::<Vec<_>>();
 
         self.summary = Some(sha256_digest_strs(batch_ids.as_slice()));
         self.remaining_batches = pending_batches;
@@ -328,7 +328,7 @@ impl CandidateBlock for FFICandidateBlock {
 impl FFICandidateBlock {
     #![allow(clippy::too_many_arguments)]
     pub fn new(
-        previous_block: Block,
+        previous_block: BlockPair,
         commit_store: CommitStore,
         scheduler: Box<dyn Scheduler>,
         committed_txn_cache: TransactionCommitCache,
@@ -500,12 +500,7 @@ impl FFICandidateBlock {
         block: Option<cpython::PyObject>,
     ) -> Result<FinalizeBlockResult, CandidateBlockError> {
         if let Some(last_batch) = self.last_batch().cloned() {
-            let block: Option<Block> = if let Some(py_block) = block {
-                let wrapper = PyObjectWrapper::new(py_block);
-                Some(Block::from(wrapper))
-            } else {
-                None
-            };
+            let block = block.map(|py_block| BlockPair::from(PyObjectWrapper::new(py_block)));
 
             Ok(FinalizeBlockResult {
                 block,

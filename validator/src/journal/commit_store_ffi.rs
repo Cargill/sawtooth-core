@@ -23,7 +23,12 @@ use protobuf;
 use sawtooth::journal::commit_store::{
     ByHeightDirection, CommitStore, CommitStoreByHeightIterator,
 };
-use sawtooth::{batch::Batch, block::Block, transaction::Transaction};
+use sawtooth::{
+    batch::Batch,
+    protocol::block::BlockPair,
+    protos::{FromBytes, IntoBytes},
+    transaction::Transaction,
+};
 use transact::database::error::DatabaseError;
 use transact::database::lmdb::LmdbDatabase;
 
@@ -403,17 +408,14 @@ pub unsafe extern "C" fn commit_store_put_blocks(
 ) -> ErrorCode {
     check_null!(commit_store, blocks);
 
-    let blocks_result: Result<Vec<Block>, ErrorCode> = slice::from_raw_parts(blocks, blocks_len)
+    let blocks_result = slice::from_raw_parts(blocks, blocks_len)
         .iter()
         .map(|ptr| {
             let entry = *ptr as *const PutEntry;
             let payload = slice::from_raw_parts((*entry).block_bytes, (*entry).block_bytes_len);
-            let proto_block: sawtooth::protos::block::Block =
-                protobuf::parse_from_bytes(&payload).expect("Failed to parse proto Block bytes");
-
-            Ok(Block::from(proto_block))
+            BlockPair::from_bytes(&payload)
         })
-        .collect();
+        .collect::<Result<_, _>>();
 
     match blocks_result {
         Ok(blocks) => match (*(commit_store as *mut CommitStore)).put_blocks(blocks) {
@@ -433,12 +435,26 @@ pub unsafe extern "C" fn commit_store_put_blocks(
 // FFI Helpers
 
 unsafe fn return_block(
-    block: Block,
+    block_pair: BlockPair,
     block_ptr: *mut *const u8,
     block_len: *mut usize,
     block_cap: *mut usize,
 ) -> ErrorCode {
-    return_proto::<_, sawtooth::protos::block::Block>(block, block_ptr, block_len, block_cap)
+    match block_pair.into_bytes() {
+        Ok(payload) => {
+            *block_cap = payload.capacity();
+            *block_len = payload.len();
+            *block_ptr = payload.as_slice().as_ptr();
+
+            mem::forget(payload);
+
+            ErrorCode::Success
+        }
+        Err(err) => {
+            warn!("Failed to serialize block to bytes: {}", err);
+            ErrorCode::DatabaseError
+        }
+    }
 }
 
 unsafe fn return_batch(

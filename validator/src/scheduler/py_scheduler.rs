@@ -67,7 +67,7 @@ impl Scheduler for PyScheduler {
     fn add_batch(
         &mut self,
         batch: Batch,
-        expected_state_hash: Option<&str>,
+        expected_state_hash: Option<&[u8]>,
         required: bool,
     ) -> Result<(), SchedulerError> {
         let header_signature = batch.header_signature.clone();
@@ -80,7 +80,11 @@ impl Scheduler for PyScheduler {
             .call_method(
                 py,
                 "add_batch",
-                (batch_wrapper, expected_state_hash, required),
+                (
+                    batch_wrapper,
+                    expected_state_hash.map(hex::encode),
+                    required,
+                ),
                 None,
             )
             .expect("No method add_batch on python scheduler");
@@ -152,7 +156,16 @@ impl Scheduler for PyScheduler {
             let beginning_state_hash = results
                 .first()
                 .map(|v| v.0.first().map(|r| r.state_hash.clone()).unwrap_or(None))
-                .unwrap_or(None);
+                .unwrap_or(None)
+                .map(|hash| {
+                    hex::decode(&hash).map_err(|_| {
+                        SchedulerError::Other(format!(
+                            "beginning state hash is not valid hex: {}",
+                            hash
+                        ))
+                    })
+                })
+                .transpose()?;
 
             let ending_state_hash = results
                 .iter()
@@ -171,7 +184,16 @@ impl Scheduler for PyScheduler {
                         .expect("Failed to unwrap batch result to get state hash")
                         .state_hash
                 })
-                .unwrap_or(None);
+                .unwrap_or(None)
+                .map(|hash| {
+                    hex::decode(&hash).map_err(|_| {
+                        SchedulerError::Other(format!(
+                            "ending state hash is not valid hex: {}",
+                            hash
+                        ))
+                    })
+                })
+                .transpose()?;
 
             let batch_txn_results = results
                 .into_iter()
