@@ -21,6 +21,7 @@
 
 use cpython::{NoArgs, ObjectProtocol, PyClone, PyDict, PyList, PyObject, Python};
 use std::collections::{HashMap, HashSet};
+use std::iter::FromIterator;
 use std::sync::mpsc::{channel, SendError, Sender};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
@@ -32,13 +33,14 @@ use sawtooth::journal::{
     chain_head_lock::ChainHeadLock,
     commit_store::CommitStore,
     publisher::{
-        BatchObserver, FinalizeBlockError, InitializeBlockError, PendingBatchesPool,
+        batch_pool::PendingBatchesPool, BatchObserver, FinalizeBlockError, InitializeBlockError,
         PublisherState, SyncPublisher,
     },
 };
+
 use sawtooth::state::{settings_view::SettingsView, state_view_factory::StateViewFactory};
 use sawtooth::{execution::execution_platform::ExecutionPlatform, protocol::block::BlockPair};
-use transact::protocol::batch::Batch;
+use transact::protocol::batch::{Batch, BatchPair};
 
 use ffi::py_import_class;
 use journal::candidate_block::FFICandidateBlock;
@@ -197,6 +199,24 @@ impl SyncPublisher for SyncBlockPublisher {
             self.cancel_block(state, false);
         }
 
+        let committed_batches: Vec<BatchPair> = committed_batches
+            .into_iter()
+            .map(|batch| {
+                batch
+                    .into_pair()
+                    .expect("Unable to convert batch to batch pair ")
+            })
+            .collect();
+
+        let uncommitted_batches: Vec<BatchPair> = uncommitted_batches
+            .into_iter()
+            .map(|batch| {
+                batch
+                    .into_pair()
+                    .expect("Unable to convert batch to batch pair ")
+            })
+            .collect();
+
         state.mut_pending_batches().update_limit(batches_len);
         state
             .mut_pending_batches()
@@ -251,7 +271,12 @@ impl SyncPublisher for SyncBlockPublisher {
 
         if permission_check && !batch_already_committed {
             // If the batch is already in the pending queue, don't do anything further
-            if state.mut_pending_batches().append(batch.clone()) {
+            if state.mut_pending_batches().append(
+                batch
+                    .clone()
+                    .into_pair()
+                    .expect("Unable to convert batch into pair"),
+            ) {
                 // Notify observers
                 for observer in state.batch_observers() {
                     observer.notify_batch_pending(&batch);
@@ -379,7 +404,7 @@ impl SyncPublisher for SyncBlockPublisher {
 
         for batch in state.pending_batches().iter() {
             if candidate_block.can_add_batch() {
-                candidate_block.add_batch(batch.clone());
+                candidate_block.add_batch(batch.batch().clone());
             } else {
                 break;
             }
@@ -403,11 +428,6 @@ impl SyncPublisher for SyncBlockPublisher {
         let res = match option_result {
             Some(result) => match result {
                 Ok(finalize_result) => {
-                    state.mut_pending_batches().update(
-                        finalize_result.remaining_batches.clone(),
-                        &finalize_result.last_batch,
-                    );
-
                     let previous_block_id = &state
                         .candidate_block()
                         .as_ref()
@@ -417,6 +437,14 @@ impl SyncPublisher for SyncBlockPublisher {
                     state.set_candidate_block(None);
                     match finalize_result.block {
                         Some(block) => {
+                            let executed_batches = HashSet::from_iter(
+                                block
+                                    .header()
+                                    .batch_ids()
+                                    .iter()
+                                    .map(|batch| batch.as_str()),
+                            );
+                            state.mut_pending_batches().update(executed_batches);
                             // Drop Ref-D: We have finished creating this block and are about to
                             // send it to the completer, so we can drop the ext. ref. to its
                             // predecessor.
