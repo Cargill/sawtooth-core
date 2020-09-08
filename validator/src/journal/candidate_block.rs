@@ -31,7 +31,9 @@ use sawtooth::journal::candidate_block::{
 };
 use sawtooth::journal::chain_commit_state::TransactionCommitCache;
 use sawtooth::journal::commit_store::CommitStore;
-use sawtooth::journal::validation_rule_enforcer;
+use sawtooth::journal::validation_rule_enforcer::{
+    ValidationRuleEnforcer, ValidationRuleEnforcerError,
+};
 use sawtooth::protocol::block::BlockPair;
 use sawtooth::scheduler::Scheduler;
 use sawtooth::state::settings_view::SettingsView;
@@ -129,14 +131,30 @@ impl CandidateBlock for FFICandidateBlock {
             {
                 let mut batches_to_test = self.pending_batches.clone();
                 batches_to_test.append(&mut batches_to_add.clone());
-
-                if !validation_rule_enforcer::enforce_validation_rules(
+                let mut validation_rule_enforcer = ValidationRuleEnforcer::new(
                     &self.settings_view,
-                    &self.get_signer_public_key_hex(),
-                    &batches_to_test,
-                ) {
-                    return;
-                }
+                    self.get_signer_public_key_hex(),
+                )
+                .expect("Unable to get ValidationRuleEnforcer");
+
+                match validation_rule_enforcer.add_batches(&batches_to_test) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        debug!(
+                            "Block validation rules violated, rejecting batch: {}",
+                            batch_header_signature
+                        );
+                        return;
+                    }
+                    Err(ValidationRuleEnforcerError::InvalidBatches(_)) => {
+                        debug!("Rejecting invalid batch: {}", batch_header_signature);
+                        return;
+                    }
+                    Err(err) => {
+                        error!("Unable to validate error: {}", err.to_string());
+                        return;
+                    }
+                };
             }
 
             for b in batches_to_add {
