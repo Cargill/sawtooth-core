@@ -16,7 +16,6 @@
  */
 
 pub mod block_manager_ffi;
-mod candidate_block;
 pub mod chain_head_lock_ffi;
 pub mod commit_store_ffi;
 pub mod incoming_batch_queue_ffi;
