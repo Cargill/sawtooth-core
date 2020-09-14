@@ -334,7 +334,6 @@ class Validator:
             block_store=block_store,
             block_manager=block_manager,
             state_database=global_state_db,
-            chain_head_lock=block_publisher.chain_head_lock,
             block_status_store=block_status_store,
             consensus_notifier=consensus_notifier,
             consensus_registry=consensus_registry,

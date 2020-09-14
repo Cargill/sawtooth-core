@@ -32,6 +32,7 @@ use transact::{
     database::lmdb::LmdbDatabase,
     execution::adapter::static_adapter::StaticExecutionAdapter,
     execution::executor::Executor,
+    protocol::batch::Batch,
     sawtooth::SawtoothToTransactHandlerAdapter,
     scheduler::serial::SerialSchedulerFactory,
     state::merkle::{MerkleRadixTree, MerkleState},
@@ -48,9 +49,12 @@ use sawtooth::{
         block_validator::{BlockValidationResultStore, BlockValidator},
         block_wrapper::BlockStatus,
         chain::*,
-        chain_head_lock::ChainHeadLock,
         chain_id_manager::ChainIdManager,
         genesis::{builder::GenesisControllerBuilder, GenesisController},
+        publisher::{
+            batch_injector::DefaultBatchInjectorFactory, BatchObserver, BlockBroadcaster,
+            BlockPublisher, BlockPublisherError,
+        },
     },
     protocol::block::BlockPair,
     protos::{FromBytes, IntoBytes},
@@ -72,6 +76,7 @@ use py_object_wrapper::PyObjectWrapper;
 
 struct Journal {
     pub chain_controller: ChainController,
+    pub block_publisher: BlockPublisher,
     pub genesis_controller: GenesisController,
 }
 
@@ -100,6 +105,7 @@ impl Journal {
 
     fn stop(&mut self) {
         self.chain_controller.stop();
+        self.block_publisher.shutdown_signaler().shutdown();
     }
 }
 
@@ -128,9 +134,10 @@ pub unsafe extern "C" fn journal_new(
     commit_store: *mut c_void,
     block_manager: *const c_void,
     state_database: *const c_void,
-    chain_head_lock: *const c_void,
     block_validation_result_cache: *const c_void,
     consensus_notifier_service: *mut c_void,
+    block_sender: *mut py_ffi::PyObject,
+    batch_observers: *mut py_ffi::PyObject,
     observers: *mut py_ffi::PyObject,
     state_pruning_block_depth: u32,
     fork_cache_keep_time: u32,
@@ -143,8 +150,9 @@ pub unsafe extern "C" fn journal_new(
         commit_store,
         block_manager,
         state_database,
-        chain_head_lock,
         consensus_notifier_service,
+        block_sender,
+        batch_observers,
         observers,
         data_directory,
         key_directory,
@@ -164,11 +172,26 @@ pub unsafe extern "C" fn journal_new(
     let py = Python::assume_gil_acquired();
 
     let py_observers = PyObject::from_borrowed_ptr(py, observers);
-    let chain_head_lock_ref = (chain_head_lock as *const ChainHeadLock).as_ref().unwrap();
+
     let consensus_notifier_service =
         Box::from_raw(consensus_notifier_service as *mut BackgroundConsensusNotifier);
     let block_status_store =
         (*(block_validation_result_cache as *const BlockValidationResultStore)).clone();
+
+    let block_broadcaster = PyBlockBroadcaster {
+        py_block_sender: PyObject::from_borrowed_ptr(py, block_sender),
+    };
+
+    let py_batch_observers = PyObject::from_borrowed_ptr(py, batch_observers);
+    let batch_observers = if let Ok(py_list) = py_batch_observers.extract::<PyList>(py) {
+        let mut res: Vec<Box<dyn BatchObserver>> = Vec::with_capacity(py_list.len(py));
+        py_list
+            .iter(py)
+            .for_each(|pyobj| res.push(Box::new(PyBatchObserver::new(pyobj))));
+        res
+    } else {
+        return ErrorCode::InvalidPythonObject;
+    };
 
     let observer_wrappers = if let Ok(py_list) = py_observers.extract::<PyList>(py) {
         let mut res: Vec<Box<dyn ChainObserver>> = Vec::with_capacity(py_list.len(py));
@@ -225,9 +248,14 @@ pub unsafe extern "C" fn journal_new(
         }
     };
 
+    let identity_signer = match get_signer(key_dir) {
+        Ok(signer) => signer,
+        Err(error_code) => return error_code,
+    };
+
     let block_validator = BlockValidator::new(
         block_manager.clone(),
-        block_validator_submitter,
+        task_submitter.clone(),
         block_status_store.clone(),
         state_view_factory.clone(),
         Box::new(SerialSchedulerFactory::new(Box::new(
@@ -237,11 +265,31 @@ pub unsafe extern "C" fn journal_new(
         merkle_state.clone(),
     );
 
+    let batch_injector_factory = Box::new(DefaultBatchInjectorFactory::new(
+        identity_signer.clone(),
+        state_view_factory,
+    ));
+
+    let block_publisher = BlockPublisher::builder()
+        .with_block_manager(block_manager)
+        .with_commit_store((*commit_store).clone())
+        .with_block_broadcaster(Box::new(block_broadcaster))
+        .with_batch_observers(batch_observers)
+        .with_batch_injector_factory(batch_injector_factory)
+        .with_merkle_state(merkle_state.clone())
+        .with_execution_task_submitter(task_submitter)
+        .with_scheduler_factory(Box::new(SerialSchedulerFactory::new(Box::new(
+            context_manager.clone(),
+        ))))
+        .start()
+        .expect("Unable to start block publisher");
+
+    let chain_head_lock = block_publisher.get_chain_head_lock();
     let chain_controller = ChainController::new(
         block_manager.clone(),
         block_validator,
         commit_store.clone(),
-        chain_head_lock_ref.clone(),
+        chain_head_lock,
         block_status_store,
         consensus_notifier_service.clone(),
         data_dir.into(),
@@ -264,10 +312,6 @@ pub unsafe extern "C" fn journal_new(
         }
     };
     let chain_id_manager = ChainIdManager::new(data_dir.into());
-    let identity_signer = match get_signer(key_dir) {
-        Ok(signer) => signer,
-        Err(error_code) => return error_code,
-    };
 
     let genesis_controller = match GenesisControllerBuilder::new()
         .with_transaction_executor(genesis_executor)
@@ -295,6 +339,7 @@ pub unsafe extern "C" fn journal_new(
     let journal = Journal {
         chain_controller,
         genesis_controller,
+        block_publisher,
     };
 
     *journal_ptr = Box::into_raw(Box::new(journal)) as *const c_void;
@@ -678,4 +723,49 @@ pub unsafe extern "C" fn block_status_store_drop(block_status_store_ptr: *mut c_
 
     Box::from_raw(block_status_store_ptr as *mut BlockValidationResultStore);
     ErrorCode::Success
+}
+
+/// wraps the python block sender to provide the BlockBroadcaster trait to the publisher.
+struct PyBlockBroadcaster {
+    py_block_sender: PyObject,
+}
+
+impl BlockBroadcaster for PyBlockBroadcaster {
+    fn broadcast(&self, block: BlockPair) -> Result<(), BlockPublisherError> {
+        let py_block: PyObjectWrapper = block.into();
+
+        let gil = Python::acquire_gil();
+        let py = gil.python();
+
+        self.py_block_sender
+            .call_method(py, "send", (&py_block,), None)
+            .map(|_| ())
+            .map_err(|py_err| {
+                ::pylogger::exception(py, "{:?}", py_err);
+                BlockPublisherError::Internal(
+                    "Unable to broadcast block due to python error".into(),
+                )
+            })
+    }
+}
+
+struct PyBatchObserver {
+    py_batch_observer: PyObject,
+}
+
+impl PyBatchObserver {
+    fn new(py_batch_observer: PyObject) -> Self {
+        PyBatchObserver { py_batch_observer }
+    }
+}
+
+impl BatchObserver for PyBatchObserver {
+    fn notify_batch_pending(&self, batch: &Batch) {
+        let gil = Python::acquire_gil();
+        let py = gil.python();
+        let batch_wrapper = PyObjectWrapper::from(batch.clone());
+        self.py_batch_observer
+            .call_method(py, "notify_batch_pending", (batch_wrapper,), None)
+            .expect("BatchObserver has no method notify_batch_pending");
+    }
 }
